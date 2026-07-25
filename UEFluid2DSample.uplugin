@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "UEFluid2DSample",
-	"Description": "Screen-space 2D stable-fluids simulation as a post process, built on SceneViewExtension and the Render Dependency Graph.",
+	"Description": "Screen-space 2D stable-fluids simulation as a post process.",
 	"Category": "Rendering",
 	"CreatedBy": "",
 	"CreatedByURL": "",
