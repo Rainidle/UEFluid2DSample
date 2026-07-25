@@ -1,0 +1,140 @@
+// Compute version of the pressure solve chain (divergence, Jacobi, projection).
+//
+// The pixel path in Fluid2D.usf spends one fullscreen render pass per Jacobi iteration,
+// so every sweep pays a render target switch and a rasterised triangle. Here a tile is
+// loaded into group shared memory once and iterated several times in place, which keeps
+// the intermediate results in LDS instead of round-tripping through VRAM.
+//
+// The halo is sized to the sweep count, so a group holds every value the same number of
+// global Jacobi passes would have read. The two paths produce the same iterate, not an
+// approximation of each other.
+//
+// All three kernels address textures with integer coordinates. The pixel path's bilinear
+// samples land on texel centres, which makes the two numerically equivalent.
+
+#include "/Engine/Public/Platform.ush"
+
+int2  SimBounds;               // simulation resolution - 1, for clamping
+float HalfRDX;                 // 0.5 / SimWidth
+float Alpha;                   // Jacobi constant, -(SimWidth^2)
+int   IterationsThisDispatch;  // in-LDS sweeps this dispatch, 1..FLUID2D_PRESSURE_HALO
+
+Texture2D<float2>   SrcVelocityTex;
+Texture2D<float>    SrcPressureTex;
+Texture2D<float>    SrcDivergenceTex;
+RWTexture2D<float2> OutVelocityUAV;
+RWTexture2D<float>  OutPressureUAV;
+RWTexture2D<float>  OutDivergenceUAV;
+
+// Free-slip boundary: clamp the neighbour back inside the domain and negate the axis
+// that went out of bounds, so the average normal flux across the wall is zero.
+float2 SampleVelocityFreeSlip(int2 Coord)
+{
+	int2 Clamped = clamp(Coord, int2(0, 0), SimBounds);
+	float2 Mult = float2(
+		(Coord.x == Clamped.x) ? 1.0 : -1.0,
+		(Coord.y == Clamped.y) ? 1.0 : -1.0);
+	return SrcVelocityTex[Clamped] * Mult;
+}
+
+[numthreads(8, 8, 1)]
+void DivergenceCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int2 C = int2(DTid.xy);
+	if (any(C > SimBounds))
+	{
+		return;
+	}
+
+	float L = SampleVelocityFreeSlip(C + int2(-1, 0)).x;
+	float R = SampleVelocityFreeSlip(C + int2( 1, 0)).x;
+	float B = SampleVelocityFreeSlip(C + int2(0, -1)).y;
+	float T = SampleVelocityFreeSlip(C + int2(0,  1)).y;
+
+	OutDivergenceUAV[C] = HalfRDX * ((R - L) + (T - B));
+}
+
+// ---------------------------------------------------------------------------
+// Jacobi pressure solve, multiple sweeps per dispatch.
+//
+// One group loads a FLUID2D_PRESSURE_TILE square into LDS. Each sweep invalidates the
+// outermost still-valid ring, because those threads lack fresh neighbours, so the tile
+// carries FLUID2D_PRESSURE_HALO rings of overlap and only the interior is written back.
+// Interiors tile the domain seamlessly. The halo costs roughly 27% extra arithmetic at the
+// default geometry, in exchange for one VRAM round trip per HALO sweeps instead of one each.
+//
+// Clamping the neighbour coordinates implements the Neumann boundary: outside the domain
+// a cell reads back itself, matching SamplePressureBounded in the pixel path.
+// ---------------------------------------------------------------------------
+groupshared float SharedP[FLUID2D_PRESSURE_TILE * FLUID2D_PRESSURE_TILE];
+
+[numthreads(FLUID2D_PRESSURE_TILE, FLUID2D_PRESSURE_TILE, 1)]
+void PressureSolveCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+	const int Interior = FLUID2D_PRESSURE_TILE - 2 * FLUID2D_PRESSURE_HALO;
+
+	int2 GTid = int2(GroupThreadId.xy);
+	int2 TileOrigin = int2(GroupId.xy) * Interior - FLUID2D_PRESSURE_HALO; // global coord of LDS (0,0)
+	int2 GCoord = TileOrigin + GTid;
+
+	const int LDSIdx = GTid.y * FLUID2D_PRESSURE_TILE + GTid.x;
+	int2 LoadCoord = clamp(GCoord, int2(0, 0), SimBounds);
+
+	// Divergence is only ever read at this thread's own cell, so it stays in a register.
+	const float Div = SrcDivergenceTex[LoadCoord];
+
+	SharedP[LDSIdx] = SrcPressureTex[LoadCoord];
+	GroupMemoryBarrierWithGroupSync();
+
+	// Distance to the tile edge is how many sweeps this thread can still contribute to.
+	const int RingDepth = min(
+		min(GTid.x, FLUID2D_PRESSURE_TILE - 1 - GTid.x),
+		min(GTid.y, FLUID2D_PRESSURE_TILE - 1 - GTid.y));
+
+	int2 LC = clamp(GCoord + int2(-1, 0), int2(0, 0), SimBounds) - TileOrigin;
+	int2 RC = clamp(GCoord + int2( 1, 0), int2(0, 0), SimBounds) - TileOrigin;
+	int2 BC = clamp(GCoord + int2(0, -1), int2(0, 0), SimBounds) - TileOrigin;
+	int2 TC = clamp(GCoord + int2(0,  1), int2(0, 0), SimBounds) - TileOrigin;
+
+	float P = SharedP[LDSIdx];
+	for (int It = 1; It <= IterationsThisDispatch; ++It)
+	{
+		// Threads that have run out of rings stop updating and hold their value for
+		// the inner rings to read.
+		if (It <= RingDepth)
+		{
+			P = (SharedP[LC.y * FLUID2D_PRESSURE_TILE + LC.x]
+			   + SharedP[RC.y * FLUID2D_PRESSURE_TILE + RC.x]
+			   + SharedP[BC.y * FLUID2D_PRESSURE_TILE + BC.x]
+			   + SharedP[TC.y * FLUID2D_PRESSURE_TILE + TC.x]
+			   + Alpha * Div) * 0.25;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		SharedP[LDSIdx] = P;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (all(GTid >= FLUID2D_PRESSURE_HALO) && all(GTid < FLUID2D_PRESSURE_TILE - FLUID2D_PRESSURE_HALO) &&
+		all(GCoord >= 0) && all(GCoord <= SimBounds))
+	{
+		OutPressureUAV[GCoord] = P;
+	}
+}
+
+[numthreads(8, 8, 1)]
+void GradientSubtractCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int2 C = int2(DTid.xy);
+	if (any(C > SimBounds))
+	{
+		return;
+	}
+
+	float L = SrcPressureTex[clamp(C + int2(-1, 0), int2(0, 0), SimBounds)];
+	float R = SrcPressureTex[clamp(C + int2( 1, 0), int2(0, 0), SimBounds)];
+	float B = SrcPressureTex[clamp(C + int2(0, -1), int2(0, 0), SimBounds)];
+	float T = SrcPressureTex[clamp(C + int2(0,  1), int2(0, 0), SimBounds)];
+
+	float2 V = SrcVelocityTex[C];
+	OutVelocityUAV[C] = V - HalfRDX * float2(R - L, T - B);
+}

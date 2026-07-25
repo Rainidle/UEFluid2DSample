@@ -1,0 +1,544 @@
+// Screen-space 2D stable fluids (Stam, "Stable Fluids"; GPU Gems ch. 38).
+// Every entry point here backs one FGlobalShader declared in Fluid2DShaders.h.
+//
+// Conventions:
+// - Simulation fields are ping-ponged: a pass reads one texture and writes the other.
+// - Velocity is measured in simulation cells per second.
+// - UV origin is top-left (D3D), so screen "up" is -Y.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush" // DecodeVelocityFromTexture
+
+// Shared uniform block. Each entry point uses a subset; the compiler strips the rest,
+// so unused declarations cost nothing. Names must match the C++ parameter struct members.
+
+Texture2D VelocityTex;        // xy = velocity, cells/second
+Texture2D SourceTex;          // generic input: the field being advected or forced
+Texture2D PressureTex;        // x = pressure
+Texture2D DivergenceTex;      // x = divergence
+Texture2D DyeTex;             // rgb = dye
+Texture2D SceneColorTex;      // copy of scene color
+Texture2D SceneDepthTex;      // device Z (reversed-Z: larger is nearer)
+Texture2D CustomDepthTex;     // device Z of actors opted into Render CustomDepth
+Texture2D GBufferVelocityTex; // engine motion vectors, encoded current-minus-previous NDC
+SamplerState BilinearClampSampler;
+SamplerState PointClampSampler;
+
+float2 InvSimResolution;
+float  DeltaTime;
+float  Dissipation;           // per-step decay applied during advection
+float  HalfRDX;               // 0.5 / SimWidth
+float  Alpha;                 // Jacobi constant, -(SimWidth^2)
+float  AspectRatio;           // SimWidth / SimHeight, keeps force falloff circular on screen
+float  SimWidth;
+
+int    ImpulseCount;
+float4 ImpulseSegment[FLUID2D_MAX_IMPULSES];          // xy = head (current pos), zw = tail (previous pos), aspect-corrected sim space
+float4 ImpulseVelocityAndRadius[FLUID2D_MAX_IMPULSES];// xy = target velocity, z = falloff radius
+float4 ImpulseDye[FLUID2D_MAX_IMPULSES];              // rgb = colour, a = amount
+
+int    ExplosionCount;
+float4 ExplosionCenterRadius[FLUID2D_MAX_EXPLOSIONS]; // xy = centre, z = radius, w = peak speed
+float4 ExplosionNoise[FLUID2D_MAX_EXPLOSIONS];        // x = seed, y = angular irregularity 0-1
+float4 ExplosionDyeColor[FLUID2D_MAX_EXPLOSIONS];     // rgb = colour, a = amount
+
+float2 SceneUVMin;            // viewport origin in scene texture UV space
+float2 SceneUVScale;          // viewport size in scene texture UV space
+float2 SceneInvExtent;        // 1 / scene texture extent
+float  BrightnessTexelScale;
+float  BrightnessHeightScale;
+float  BrightnessStrength;
+
+float2 ViewportMin;           // viewport top-left in pixels
+float2 InvViewportSize;
+float  DistortionStrength;
+float  DyeIntensity;
+
+float  NoiseScale;            // noise repetitions across the screen
+float  NoiseSpeed;
+float  NoiseStrength;
+float  Time;                  // world time in seconds
+
+float  AccumStrength;         // scene highlight bleed into the dye field
+float  AccumThreshold;        // HDR luminance floor for the bleed
+
+int    MaskEnabled;
+float  MaskDepthBias;         // device-Z tolerance, avoids self-occlusion flicker
+float  MaskInkStrength;
+
+int    MotionUseMask;
+float  MotionBlend;
+float  MotionInkStrength;
+float  RawDeltaTime;          // unscaled frame time; motion vectors are a one-frame delta
+
+int    PaletteMode;
+float  MaskShowModel;         // how strongly masked pixels are kept free of dye, 0-1
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Fullscreen passes carry no UVs, so derive them from the pixel centre.
+float2 SimUV(float4 SvPosition)
+{
+	return SvPosition.xy * InvSimResolution;
+}
+
+// Free-slip boundary: outside the domain, mirror the neighbouring cell and negate the
+// out-of-bounds axis so the average normal flux across the wall is zero.
+float2 SampleVelocityBounded(float2 UV)
+{
+	float2 CellOffset = float2(0.0, 0.0);
+	float2 Multiplier = float2(1.0, 1.0);
+
+	if (UV.x < 0.0)      { CellOffset.x =  1.0; Multiplier.x = -1.0; }
+	else if (UV.x > 1.0) { CellOffset.x = -1.0; Multiplier.x = -1.0; }
+	if (UV.y < 0.0)      { CellOffset.y =  1.0; Multiplier.y = -1.0; }
+	else if (UV.y > 1.0) { CellOffset.y = -1.0; Multiplier.y = -1.0; }
+
+	return Multiplier * VelocityTex.SampleLevel(BilinearClampSampler, UV + CellOffset * InvSimResolution, 0).xy;
+}
+
+// Neumann boundary: zero pressure gradient across the wall, so an out-of-bounds
+// neighbour reads back the cell just inside it.
+float SamplePressureBounded(Texture2D Tex, float2 UV)
+{
+	float2 CellOffset = float2(0.0, 0.0);
+
+	if (UV.x < 0.0)      CellOffset.x =  1.0;
+	else if (UV.x > 1.0) CellOffset.x = -1.0;
+	if (UV.y < 0.0)      CellOffset.y =  1.0;
+	else if (UV.y > 1.0) CellOffset.y = -1.0;
+
+	return Tex.SampleLevel(BilinearClampSampler, UV + CellOffset * InvSimResolution, 0).x;
+}
+
+float Hash12(float2 P)
+{
+	float3 P3 = frac(float3(P.x, P.y, P.x) * 0.1031);
+	P3 += dot(P3, P3.yzx + 33.33);
+	return frac((P3.x + P3.y) * P3.z);
+}
+
+// Value noise with analytic derivatives: returns (value, d/dx, d/dy) from one evaluation.
+float3 ValueNoiseDeriv(float2 P)
+{
+	float2 I = floor(P);
+	float2 F = frac(P);
+
+	float A = Hash12(I + float2(0.0, 0.0));
+	float B = Hash12(I + float2(1.0, 0.0));
+	float C = Hash12(I + float2(0.0, 1.0));
+	float D = Hash12(I + float2(1.0, 1.0));
+
+	// Quintic fade and its derivative; C2 continuity keeps the gradient field smooth.
+	float2 U  = F * F * F * (F * (F * 6.0 - 15.0) + 10.0);
+	float2 DU = 30.0 * F * F * (F * (F - 2.0) + 1.0);
+
+	float K = A - B - C + D;
+	float N = A + (B - A) * U.x + (C - A) * U.y + K * U.x * U.y;
+	float2 Grad = DU * (float2(B - A, C - A) + K * U.yx);
+
+	return float3(N, Grad.x, Grad.y);
+}
+
+// A pixel is inside the mask when it has custom depth and nothing occludes it.
+float SampleVisibilityMask(float2 SceneUV)
+{
+	float SceneZ  = SceneDepthTex.SampleLevel(PointClampSampler, SceneUV, 0).r;
+	float CustomZ = CustomDepthTex.SampleLevel(PointClampSampler, SceneUV, 0).r;
+	return (CustomZ > 0.0 && CustomZ + MaskDepthBias >= SceneZ) ? 1.0 : 0.0;
+}
+
+// One-frame screen displacement in viewport UV space. A positive x channel marks pixels
+// that actually wrote velocity this frame, which is how the engine flags dynamic geometry.
+float2 SampleMotionViewportUV(float2 SceneUV)
+{
+	float4 Encoded = GBufferVelocityTex.SampleLevel(PointClampSampler, SceneUV, 0);
+	if (Encoded.x <= 0.0)
+	{
+		return float2(0.0, 0.0);
+	}
+	float2 NDCDelta = DecodeVelocityFromTexture(Encoded).xy;
+	return NDCDelta * float2(0.5, -0.5); // NDC (Y up) to viewport UV (Y down)
+}
+
+// Distance from P to segment AB, plus the projection ratio along it (drives the taper).
+float DistanceToSegment(float2 A, float2 B, float2 P, out float FracProj)
+{
+	float2 D = P - A;
+	float2 X = B - A;
+
+	FracProj = 0.0;
+	float LX = length(X);
+	if (LX <= 0.0001)
+	{
+		return length(D);
+	}
+
+	float Proj = dot(D, X / LX);
+	FracProj = Proj / LX;
+
+	if (Proj < 0.0)
+	{
+		return length(D);
+	}
+	else if (Proj > LX)
+	{
+		return length(P - B);
+	}
+	return sqrt(abs(dot(D, D) - Proj * Proj));
+}
+
+// ---------------------------------------------------------------------------
+// Semi-Lagrangian advection. Used for both velocity (self-advection) and dye.
+// ---------------------------------------------------------------------------
+void AdvectPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+
+	float2 Vel = VelocityTex.SampleLevel(BilinearClampSampler, UV, 0).xy;
+	float2 TracedUV = UV - Vel * InvSimResolution * DeltaTime;
+
+	OutColor = Dissipation * SourceTex.SampleLevel(BilinearClampSampler, TracedUV, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Segment impulses: force and dye injected along the path a point travelled this frame.
+// Up to FLUID2D_MAX_IMPULSES are packed per frame; DYE_MODE picks the target field.
+// ---------------------------------------------------------------------------
+void SplatPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	// Scaling x by the aspect ratio keeps the falloff circular on screen.
+	float2 P = float2(UV.x * AspectRatio, UV.y);
+
+#if DYE_MODE
+	float4 Value = SourceTex.SampleLevel(BilinearClampSampler, UV, 0);
+#else
+	// Velocity decay lives here so it stays coupled to impulse injection; frames without
+	// impulses skip this pass and fold the same factor into advection instead.
+	float4 Value = float4(SourceTex.SampleLevel(BilinearClampSampler, UV, 0).xy * 0.999, 0.0, 1.0);
+#endif
+
+	for (int i = 0; i < ImpulseCount; ++i)
+	{
+		float2 Head = ImpulseSegment[i].xy;
+		float2 Tail = ImpulseSegment[i].zw;
+
+		float FracProj;
+		float L = DistanceToSegment(Head, Tail, P, FracProj);
+
+		// Fade towards the tail so a drag reads as a cone rather than a uniform tube.
+		float TaperFactor = 0.6;
+		float ProjectedFraction = 1.0 - saturate(FracProj) * TaperFactor;
+
+		float Radius = ImpulseVelocityAndRadius[i].z;
+		float M = exp(-L / Radius) * ProjectedFraction * ProjectedFraction;
+
+#if DYE_MODE
+		Value.rgb += ImpulseDye[i].rgb * (ImpulseDye[i].a * M);
+#else
+		float2 TargetVel = ImpulseVelocityAndRadius[i].xy * SimWidth;
+		Value.xy += (TargetVel - Value.xy) * M;
+#endif
+	}
+
+	OutColor = Value;
+}
+
+// ---------------------------------------------------------------------------
+// Procedural radial burst
+// The seed offsets the noise domain
+// ---------------------------------------------------------------------------
+void ExplosionPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float2 P = float2(UV.x * AspectRatio, UV.y);
+
+	float4 Value = SourceTex.SampleLevel(BilinearClampSampler, UV, 0);
+
+	for (int i = 0; i < ExplosionCount; ++i)
+	{
+		float2 C = ExplosionCenterRadius[i].xy;
+		float R = max(ExplosionCenterRadius[i].z, 1e-4);
+		float PeakSpeed = ExplosionCenterRadius[i].w;
+
+		float2 D = P - C;
+		float Dist = length(D);
+		if (Dist >= R || Dist < 1e-5)
+		{
+			continue;
+		}
+
+		float2 Dir = D / Dist;
+		float X = Dist / R;
+
+		// Ring profile: zero at the centre so nothing tears, peaking near 0.35R.
+		float Profile = 4.66 * X * exp(-4.0 * X * X);
+
+		float Seed = ExplosionNoise[i].x;
+		float Irregularity = ExplosionNoise[i].y;
+		float3 N = ValueNoiseDeriv(D * (3.0 / R) + float2(Seed, Seed * 0.613));
+		float RadialScale = 1.0 + Irregularity * (N.x * 2.0 - 1.0);
+		// A little tangential push so the blast swirls instead of staying a perfect circle.
+		float2 Tangent = float2(-Dir.y, Dir.x);
+
+#if DYE_MODE
+		Value.rgb += ExplosionDyeColor[i].rgb * (ExplosionDyeColor[i].a * Profile * saturate(RadialScale));
+#else
+		Value.xy += (Dir * RadialScale + Tangent * (Irregularity * (N.x - 0.5))) * (Profile * PeakSpeed);
+#endif
+	}
+
+	OutColor = Value;
+}
+
+// ---------------------------------------------------------------------------
+// Screen brightness force: treat scene luminance as a height field and push the fluid
+// along the pseudo-normal derived from it.
+// ---------------------------------------------------------------------------
+void BrightnessForcePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float2 V = SourceTex.SampleLevel(BilinearClampSampler, UV, 0).xy;
+
+	float2 SceneUV  = SceneUVMin + UV * SceneUVScale;
+	float2 SceneUVE = SceneUV + float2(SceneInvExtent.x * BrightnessTexelScale, 0.0);
+	float2 SceneUVN = SceneUV + float2(0.0, SceneInvExtent.y * BrightnessTexelScale);
+
+	float3 C  = SceneColorTex.SampleLevel(BilinearClampSampler, SceneUV,  0).rgb;
+	float3 CE = SceneColorTex.SampleLevel(BilinearClampSampler, SceneUVE, 0).rgb;
+	float3 CN = SceneColorTex.SampleLevel(BilinearClampSampler, SceneUVN, 0).rgb;
+
+	// Normalising drops absolute exposure and keeps only local structure.
+	C  /= max(length(C),  0.0001);
+	CE /= max(length(CE), 0.0001);
+	CN /= max(length(CN), 0.0001);
+
+	float H  = (C.r  + C.g  + C.b ) * 0.3333333 * BrightnessHeightScale;
+	float HE = (CE.r + CE.g + CE.b) * 0.3333333 * BrightnessHeightScale;
+	float HN = (CN.r + CN.g + CN.b) * 0.3333333 * BrightnessHeightScale;
+
+	float3 BV = normalize(float3(SceneUVN.x, SceneUVN.y, HN) - float3(SceneUV.x, SceneUV.y, H));
+	float3 TV = normalize(float3(SceneUVE.x, SceneUVE.y, HE) - float3(SceneUV.x, SceneUV.y, H));
+	float3 Norm = normalize(cross(TV, BV));
+
+	OutColor = float4(V + Norm.xy * BrightnessStrength, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Curl noise force. Taking the curl of a scalar potential yields a divergence-free
+// field, so the energy injected here survives the pressure projection instead of
+// being cancelled by it.
+// ---------------------------------------------------------------------------
+void NoiseForcePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float2 V = SourceTex.SampleLevel(BilinearClampSampler, UV, 0).xy;
+
+	float2 P = float2(UV.x * AspectRatio, UV.y) * NoiseScale;
+
+	// Two octaves scrolling in opposite directions, so the field evolves rather than pans.
+	float3 N0 = ValueNoiseDeriv(P + float2(Time * NoiseSpeed, Time * NoiseSpeed * 0.37));
+	float3 N1 = ValueNoiseDeriv(P * 2.03 + float2(-Time * NoiseSpeed * 1.7, Time * NoiseSpeed * 0.61));
+	float2 Grad = N0.yz + 0.5 * N1.yz;
+
+	float2 Curl = float2(Grad.y, -Grad.x);
+
+	OutColor = float4(V + Curl * NoiseStrength, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Motion vector force: blend the fluid towards each pixel's real screen motion, taken
+// from the engine's velocity buffer. Unlike a segment impulse, which only expresses
+// "the centroid moved from A to B", this picks up skinned deformation, so limbs and
+// rotation stir the field even when the actor's origin never moves.
+// ---------------------------------------------------------------------------
+void MotionForcePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float2 V = SourceTex.SampleLevel(BilinearClampSampler, UV, 0).xy;
+
+	float2 SceneUV = SceneUVMin + UV * SceneUVScale;
+
+	float Mask = (MotionUseMask != 0) ? SampleVisibilityMask(SceneUV) : 1.0;
+
+	float2 MotionUV = SampleMotionViewportUV(SceneUV);
+	float2 TargetVel = (MotionUV / InvSimResolution) / max(RawDeltaTime, 0.0001);
+
+	// Ramp the weight in over the first ~20 cells/s so slow and static pixels do not
+	// pin the fluid in place.
+	float Weight = Mask * MotionBlend * saturate(length(TargetVel) / 20.0);
+
+	OutColor = float4(lerp(V, TargetVel, saturate(Weight)), 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Dye sources. Three contributions, all optional:
+//   - scene highlights above a threshold bleed in and get dragged into trails;
+//   - masked silhouettes bleed continuously, tinted with the object's own colour;
+//   - fast-moving masked pixels bleed proportionally to their speed.
+// With the mask off this degrades to a plain fullscreen highlight bleed.
+// ---------------------------------------------------------------------------
+void AccumulatePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float4 Dye = SourceTex.SampleLevel(BilinearClampSampler, UV, 0);
+
+	float2 SceneUV = SceneUVMin + UV * SceneUVScale;
+	float3 Scene = SceneColorTex.SampleLevel(BilinearClampSampler, SceneUV, 0).rgb;
+
+	float Mask = (MaskEnabled != 0) ? SampleVisibilityMask(SceneUV) : 1.0;
+
+	float3 BrightInk = max(Scene - AccumThreshold, 0.0) * AccumStrength;
+	float3 MaskInk = Mask * MaskInkStrength * Scene;
+
+	float3 Ink = (MaskEnabled != 0) ? (BrightInk * Mask + MaskInk) : BrightInk;
+
+	if (MotionInkStrength > 0.0)
+	{
+		#if 0
+		float2 MotionUV = SampleMotionViewportUV(SceneUV);
+		float SpeedPx = length(MotionUV / InvSimResolution) / max(RawDeltaTime, 0.0001);
+		Ink += Mask * saturate(SpeedPx / 200.0) * MotionInkStrength * Scene;
+		#else
+        float2 MotionCells = SampleMotionViewportUV(SceneUV) / InvSimResolution;
+        float Speed = length(MotionCells) * InvSimResolution.y / max(RawDeltaTime, 0.0001);
+        Ink += Mask * min(Speed, 4.0) * MotionInkStrength * Scene;
+		#endif
+    }
+
+	OutColor = float4(Dye.rgb + Ink, Dye.a);
+}
+
+// ---------------------------------------------------------------------------
+// Dye blur, each tap averages a 2x2 quad, and the
+// four overlapping quads land on precisely those weights.
+// ---------------------------------------------------------------------------
+void BlurPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+	float2 HalfTexel = 0.5 * InvSimResolution;
+
+	float3 Sum =
+		  SourceTex.SampleLevel(BilinearClampSampler, UV + float2(-HalfTexel.x, -HalfTexel.y), 0).rgb
+		+ SourceTex.SampleLevel(BilinearClampSampler, UV + float2( HalfTexel.x, -HalfTexel.y), 0).rgb
+		+ SourceTex.SampleLevel(BilinearClampSampler, UV + float2(-HalfTexel.x,  HalfTexel.y), 0).rgb
+		+ SourceTex.SampleLevel(BilinearClampSampler, UV + float2( HalfTexel.x,  HalfTexel.y), 0).rgb;
+
+	OutColor = float4(Sum * 0.25, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Divergence, central difference: div = 0.5/dx * ((R.x - L.x) + (T.y - B.y))
+// ---------------------------------------------------------------------------
+void DivergencePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+
+	float2 L = SampleVelocityBounded(UV - float2(InvSimResolution.x, 0.0));
+	float2 R = SampleVelocityBounded(UV + float2(InvSimResolution.x, 0.0));
+	float2 B = SampleVelocityBounded(UV - float2(0.0, InvSimResolution.y));
+	float2 T = SampleVelocityBounded(UV + float2(0.0, InvSimResolution.y));
+
+	float Div = HalfRDX * ((R.x - L.x) + (T.y - B.y));
+	OutColor = float4(Div, 0.0, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// One Jacobi sweep of the pressure Poisson equation
+// ---------------------------------------------------------------------------
+void PressureSolvePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+
+	float L = SamplePressureBounded(PressureTex, UV - float2(InvSimResolution.x, 0.0));
+	float R = SamplePressureBounded(PressureTex, UV + float2(InvSimResolution.x, 0.0));
+	float B = SamplePressureBounded(PressureTex, UV - float2(0.0, InvSimResolution.y));
+	float T = SamplePressureBounded(PressureTex, UV + float2(0.0, InvSimResolution.y));
+
+	float Div = DivergenceTex.SampleLevel(BilinearClampSampler, UV, 0).x;
+
+	float P = (L + R + B + T + Alpha * Div) * 0.25;
+	OutColor = float4(P, 0.0, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Projection: subtract the pressure gradient to make the velocity field divergence-free.
+// ---------------------------------------------------------------------------
+void GradientSubtractPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = SimUV(SvPosition);
+
+	float L = SamplePressureBounded(PressureTex, UV - float2(InvSimResolution.x, 0.0));
+	float R = SamplePressureBounded(PressureTex, UV + float2(InvSimResolution.x, 0.0));
+	float B = SamplePressureBounded(PressureTex, UV - float2(0.0, InvSimResolution.y));
+	float T = SamplePressureBounded(PressureTex, UV + float2(0.0, InvSimResolution.y));
+
+	float2 V = VelocityTex.SampleLevel(BilinearClampSampler, UV, 0).xy;
+
+	OutColor = float4(V - HalfRDX * float2(R - L, T - B), 0.0, 1.0);
+}
+
+// Cosine gradient palette, a + b*cos(2*pi*(c*t + d)).
+float3 CosPalette(float T)
+{
+	const float3 A = float3(0.5, 0.5, 0.5);
+	const float3 B = float3(0.5, 0.5, 0.5);
+	const float3 C = float3(1.0, 1.0, 1.0);
+	const float3 D = float3(0.0, 0.33, 0.67);
+	return A + B * cos(6.28318 * (C * T + D));
+}
+
+// ---------------------------------------------------------------------------
+// Composite back into scene colour: refract through the velocity field, then present
+// the dye either as a direct RGB overlay or through a density-driven palette.
+// Note this pass runs over the viewport rect rather than the simulation grid, so its
+// UV derivation differs from every other entry point here.
+// ---------------------------------------------------------------------------
+void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	// Viewport-relative 0-1 UV; the simulation grid spans exactly this rect.
+	float2 ViewUV = (SvPosition.xy - ViewportMin) * InvViewportSize;
+
+	float2 Vel = VelocityTex.SampleLevel(BilinearClampSampler, ViewUV, 0).xy;
+	float3 Dye = DyeTex.SampleLevel(BilinearClampSampler, ViewUV, 0).rgb;
+
+	// Masked pixels bleed dye every frame, so without this they would sit under a
+	// permanent film of it. Protecting them lets the object read through cleanly and
+	// keeps the fluid to its surroundings.
+	float Protect = 0.0;
+	if (MaskEnabled != 0 && MaskShowModel > 0.0)
+	{
+		Protect = MaskShowModel * SampleVisibilityMask(SvPosition.xy * SceneInvExtent);
+	}
+
+	float DyeLum = dot(Dye, float3(0.299, 0.587, 0.114));
+
+	// Weighting the refraction by dye density confines it to inked areas; the noise
+	// force covers the whole screen, and unweighted it would wobble the entire image.
+	float DistortWeight = saturate(DyeLum * 4.0) * (1.0 - Protect);
+
+	float2 OffsetViewUV = Vel * InvSimResolution * (DistortionStrength * DistortWeight);
+
+	// Scene colour may be larger than the viewport (editor viewports, dynamic resolution),
+	// so convert the viewport-space offset into texture space and clamp inside the rect.
+	float2 SceneUV = SvPosition.xy * SceneInvExtent - OffsetViewUV * SceneUVScale;
+	SceneUV = clamp(SceneUV, SceneUVMin, SceneUVMin + SceneUVScale - SceneInvExtent);
+
+	float3 Scene = SceneColorTex.SampleLevel(BilinearClampSampler, SceneUV, 0).rgb;
+
+	float3 Result;
+	if (PaletteMode != 0)
+	{
+		float3 FluidColor = CosPalette(DyeLum * 0.7 + Time * 0.05) * (0.35 * DyeIntensity);
+		Result = lerp(Scene, FluidColor, saturate(DyeLum * 1.2) * (1.0 - Protect));
+	}
+	else
+	{
+		Result = Scene + Dye * (DyeIntensity * (1.0 - Protect));
+	}
+
+	OutColor = float4(Result, 1.0);
+}
